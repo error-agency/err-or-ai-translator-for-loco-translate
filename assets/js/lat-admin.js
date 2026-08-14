@@ -23,9 +23,11 @@
 
     // ─── Default Prompt Preview ─────────────────────────────────────────────
     $('#lat-show-default-prompt').on('click', function () {
+        const $btn = $(this);
         const $pre = $('#lat-default-prompt-preview');
-        $pre.is(':visible') ? $pre.slideUp() : $pre.slideDown();
-        $(this).text($pre.is(':visible') ? 'Hide default prompt' : 'View default prompt');
+        $pre.slideToggle(200, function () {
+            $btn.text($pre.is(':visible') ? 'Hide default prompt' : 'View default prompt');
+        });
     });
 
     // ─── Load Models ────────────────────────────────────────────────────────

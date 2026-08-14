@@ -507,7 +507,12 @@
 .lat-stop-btn:disabled { opacity: .6 !important; cursor: wait !important; }
 
 /* ── Reload button ───────────────────────────────────────────────── */
-.lat-reload-btn { vertical-align: middle; margin-left: 8px !important; }
+.lat-reload-btn {
+    vertical-align: middle;
+    margin-left: 8px !important;
+}
+
+.lat-ai-btn {
     font-weight: 600 !important;
     height: 30px !important;
     line-height: 28px !important;
