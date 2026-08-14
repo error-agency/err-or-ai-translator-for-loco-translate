@@ -36,9 +36,9 @@
         const $select = $('#lat-model-select');
         const $input = $('#lat-model-input');
 
-        const provider    = $('.lat-provider-tab input[type=radio]:checked').val();
-        const apiEndpoint = $('#lat-api-endpoint').val().trim();
-        const apiKey      = $('input[name="error_lait_settings[api_key]"]').val().trim();
+        const provider    = $('.lat-provider-tab input[type=radio]:checked').val() || 'openrouter';
+        const apiEndpoint = String($('#lat-api-endpoint').val() || '').trim();
+        const apiKey      = String($('input[name="error_lait_settings[api_key]"]').val() || '').trim();
 
         $btn.text('Loading…').prop('disabled', true);
 
@@ -83,10 +83,10 @@
         const $btn = $(this);
         const $result = $('#lat-test-result');
 
-        const provider    = $('.lat-provider-tab input[type=radio]:checked').val();
-        const apiEndpoint = $('#lat-api-endpoint').val().trim();
-        const apiKey      = $('input[name="error_lait_settings[api_key]"]').val().trim();
-        const model       = $('#lat-model-input').val().trim();
+        const provider    = $('.lat-provider-tab input[type=radio]:checked').val() || 'openrouter';
+        const apiEndpoint = String($('#lat-api-endpoint').val() || '').trim();
+        const apiKey      = String($('input[name="error_lait_settings[api_key]"]').val() || '').trim();
+        const model       = String($('#lat-model-input').val() || '').trim();
 
         $btn.text('Testing…').prop('disabled', true);
         $result.removeClass('lat-test-ok lat-test-err').text('');
