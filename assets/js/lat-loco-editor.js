@@ -346,6 +346,7 @@
         if (cancelPending) { finishJob(false); return; }
 
         var batchStartMs = Date.now();
+        var requestId    = 'req_' + Date.now() + '_' + Math.floor(Math.random() * 99999);
 
         _xhrRef = $.post(errorLaitLoco.ajaxUrl, {
             action          : 'error_lait_translate_file',
@@ -355,6 +356,7 @@
             batch_index     : stats.batchCount,
             total_original  : totalOriginal,
             job_id          : currentJobId,
+            request_id      : requestId,
         }, function (res) {
             _xhrRef = null;
             var batchMs = Date.now() - batchStartMs;
@@ -371,7 +373,7 @@
 
             stats.batchCount++;
             stats.translated       = d.translated  || 0;
-            stats.skipped         += (d.skipped     || 0);
+            stats.skipped          = d.skipped     || 0;
             stats.tokensPrompt    += (d.tokens_prompt     || 0);
             stats.tokensCompletion+= (d.tokens_completion || 0);
             stats.tokensTotal     += (d.tokens_total      || 0);
@@ -387,6 +389,10 @@
                 d.batch_preview || []
             );
             updateSummaryLive();
+
+            if (d.save_warning) {
+                showNotice('⚠ Warning: ' + d.save_warning, 'warning');
+            }
 
             if (d.cancelled) { finishJob(false); return; }
             if (d.done)      { finishJob(true);  return; }
@@ -427,16 +433,24 @@
             : elapsed + 's';
 
         var msg;
+        var noticeType = 'success';
         if (!completed) {
             msg = '⏹ Stopped. <strong>' + stats.translated + ' strings</strong> saved so far.';
+            noticeType = 'warning';
         } else {
-            msg = '✓ Done! <strong>' + stats.translated + ' string' +
-                  (stats.translated !== 1 ? 's' : '') + '</strong> translated';
-            if (stats.skipped > 0) msg += ', <strong>' + stats.skipped + ' skipped</strong>';
-            msg += ' in ' + elStr + '.';
+            if (stats.skipped > 0) {
+                msg = '⚠ Completed with errors. <strong>' + stats.translated + ' string' +
+                      (stats.translated !== 1 ? 's' : '') + '</strong> translated, <strong>' +
+                      stats.skipped + ' skipped/failed</strong> in ' + elStr + '.';
+                noticeType = 'warning';
+            } else {
+                msg = '✓ Done! <strong>' + stats.translated + ' string' +
+                      (stats.translated !== 1 ? 's' : '') + '</strong> translated in ' + elStr + '.';
+                noticeType = 'success';
+            }
         }
 
-        showNotice(msg, completed ? 'success' : 'warning', true);
+        showNotice(msg, noticeType, true);
         showFinalSummary(completed, elStr);
 
         var $r = $('<button>', {
@@ -514,15 +528,16 @@
 
     function showFinalSummary(completed, elStr) {
         var $s = $('#lat-summary').show();
-        var costEst = stats.tokensTotal > 0
-            ? ' (~$' + (stats.tokensTotal * 0.0000015).toFixed(4) + ' est.)'
-            : '';
+        var statusLabel = completed
+            ? (stats.skipped > 0 ? '⚠ Completed with errors' : '✅ Complete')
+            : '⏹ Stopped';
+
         $s.html(
-            '<strong>' + (completed ? '✅ Complete' : '⏹ Stopped') + '</strong>' +
+            '<strong>' + statusLabel + '</strong>' +
             '<span>⏱ ' + elStr + '</span>' +
             '<span>✅ ' + stats.translated + ' translated</span>' +
             (stats.skipped > 0 ? '<span>⚠ ' + stats.skipped + ' skipped</span>' : '') +
-            '<span>🔢 ' + stats.tokensTotal + ' tokens' + costEst + '</span>' +
+            '<span>🔢 ' + stats.tokensTotal + ' tokens</span>' +
             '<span>↑ ' + stats.tokensPrompt + ' / ↓ ' + stats.tokensCompletion + '</span>' +
             '<span>📦 ' + stats.batchCount + ' batches</span>'
         );

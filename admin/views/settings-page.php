@@ -83,8 +83,15 @@ $provider = $settings['provider'];
 							<th><?php esc_html_e( 'API Key', 'err-or-ai-translator-for-loco-translate' ); ?></th>
 							<td>
 								<input type="password" name="error_lait_settings[api_key]"
-									value="<?php echo esc_attr( $settings['api_key'] ); ?>"
+									value=""
+									placeholder="<?php echo ! empty( $settings['api_key'] ) ? esc_attr__( 'API key saved — leave empty to keep', 'err-or-ai-translator-for-loco-translate' ) : ''; ?>"
 									class="regular-text" autocomplete="new-password">
+								<?php if ( ! empty( $settings['api_key'] ) ) : ?>
+									<label style="margin-left:10px;">
+										<input type="checkbox" name="error_lait_settings[clear_api_key]" value="1">
+										<?php esc_html_e( 'Clear saved API key', 'err-or-ai-translator-for-loco-translate' ); ?>
+									</label>
+								<?php endif; ?>
 								<p class="description">
 									<?php esc_html_e( 'Leave empty if using a local Ollama endpoint without authentication.', 'err-or-ai-translator-for-loco-translate' ); ?>
 									<a href="https://openrouter.ai/keys" target="_blank" rel="noopener">

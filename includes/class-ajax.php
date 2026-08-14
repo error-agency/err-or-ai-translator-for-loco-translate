@@ -27,7 +27,7 @@ class Ajax {
 	public function get_po_info() {
 		check_ajax_referer( 'error_lait_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+			wp_send_json_error( [ 'message' => 'Недостатъчни права.' ], 403 );
 		}
 
 		$po_path = $this->validate_po_path( wp_unslash( $_POST['po_path'] ?? '' ) );
@@ -45,13 +45,7 @@ class Ajax {
 		$untranslated    = Po_Handler::get_untranslated( $entries, $skip_translated );
 		$total           = count( $entries );
 		$total_untrans   = count( $untranslated );
-
-		// Detect locale from filename
-		$basename        = pathinfo( $po_path, PATHINFO_FILENAME );
-		$detected_locale = '';
-		if ( preg_match( '/[-_]([a-z]{2,3}_[A-Z]{2,3})$/', $basename, $m ) ) {
-			$detected_locale = $m[1];
-		}
+		$detected_locale = Po_Handler::get_locale( $entries, $po_path );
 
 		wp_send_json_success( [
 			'path'            => $po_path,
@@ -64,53 +58,98 @@ class Ajax {
 	public function translate_file() {
 		check_ajax_referer( 'error_lait_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+			wp_send_json_error( [ 'message' => 'Недостатъчни права.' ], 403 );
 		}
 
 		if ( ! ini_get( 'safe_mode' ) ) {
 			@set_time_limit( 300 );
 		}
 
-		$po_path     = $this->validate_po_path( wp_unslash( $_POST['po_path'] ?? '' ) );
+		$raw_path    = wp_unslash( $_POST['po_path'] ?? '' );
+		$po_path     = $this->validate_po_path( $raw_path );
 		$target_lang = sanitize_text_field( wp_unslash( $_POST['target_lang'] ?? 'Bulgarian' ) );
-		$batch_index = absint( $_POST['batch_index'] ?? 0 );
 		$job_id      = sanitize_key( $_POST['job_id'] ?? '' );
+		$request_id  = sanitize_key( $_POST['request_id'] ?? '' );
 
 		if ( is_wp_error( $po_path ) ) {
 			wp_send_json_error( [ 'message' => $po_path->get_error_message() ] );
 		}
 
-		// ── Cancel check ─────────────────────────────────────────────────────
-		if ( $job_id && get_transient( 'error_lait_cancel_' . $job_id ) ) {
+		if ( empty( $job_id ) ) {
+			$job_id = 'error_lait_' . uniqid();
+		}
+
+		// ── Специфично състояние на работата (Job Transient State) ───────────
+		$transient_key = 'error_lait_job_' . $job_id;
+		$job_state     = get_transient( $transient_key );
+
+		if ( ! is_array( $job_state ) ) {
+			$entries         = Po_Handler::parse( $po_path );
+			if ( is_wp_error( $entries ) ) {
+				wp_send_json_error( [ 'message' => $entries->get_error_message() ] );
+			}
+			$settings        = Settings::instance();
+			$skip_translated = (bool) $settings->get( 'skip_translated', true );
+			$untranslated    = Po_Handler::get_untranslated( $entries, $skip_translated );
+
+			$job_state = [
+				'po_path'            => $po_path,
+				'file_mtime'         => file_exists( $po_path ) ? filemtime( $po_path ) : 0,
+				'target_lang'        => $target_lang,
+				'skip_translated'    => $skip_translated,
+				'total_initial'      => count( $untranslated ),
+				'translated_indices' => [],
+				'failed_indices'     => [],
+				'processed_indices'  => [],
+				'batch_sequence'     => 0,
+				'last_request_id'    => '',
+				'last_response'      => null,
+				'cancelled'          => false,
+				'started_at'         => time(),
+			];
+			set_transient( $transient_key, $job_state, 2 * HOUR_IN_SECONDS );
+		}
+
+		// Идемпотентност: Проверка дали този request_id вече е бил обработен
+		if ( ! empty( $request_id ) && $job_state['last_request_id'] === $request_id && ! empty( $job_state['last_response'] ) ) {
+			wp_send_json_success( $job_state['last_response'] );
+		}
+
+		// Проверка за отмяна
+		if ( ! empty( $job_state['cancelled'] ) || get_transient( 'error_lait_cancel_' . $job_id ) ) {
+			delete_transient( $transient_key );
 			delete_transient( 'error_lait_cancel_' . $job_id );
 			wp_send_json_success( [
 				'done'      => true,
 				'cancelled' => true,
-				'message'   => 'Translation cancelled by user.',
+				'message'   => 'Преводът бе отменен от потребителя.',
 			] );
 		}
 
-		$entries = null;
-		if ( $job_id ) {
-			$entries = get_transient( 'error_lait_entries_' . $job_id );
-		}
-
-		if ( empty( $entries ) || ! is_array( $entries ) ) {
-			$entries = Po_Handler::parse( $po_path );
-			if ( is_wp_error( $entries ) ) {
-				wp_send_json_error( [ 'message' => $entries->get_error_message() ] );
-			}
+		// Зареждане на PO файла
+		$entries = Po_Handler::parse( $po_path );
+		if ( is_wp_error( $entries ) ) {
+			wp_send_json_error( [ 'message' => $entries->get_error_message() ] );
 		}
 
 		$settings        = Settings::instance();
-		$skip_translated = (bool) $settings->get( 'skip_translated', true );
+		$skip_translated = $job_state['skip_translated'];
 		$batch_sz        = max( 1, (int) $settings->get( 'batch_size', 40 ) );
 		$max_retries     = max( 0, (int) $settings->get( 'max_retries', 3 ) );
+		$all_untrans     = Po_Handler::get_untranslated( $entries, $skip_translated );
 
-		$untranslated = Po_Handler::get_untranslated( $entries, $skip_translated );
+		// Филтриране на вече обработените в текущата работа записи
+		$processed_map = array_flip( $job_state['processed_indices'] );
+		$untranslated  = [];
+		foreach ( $all_untrans as $item ) {
+			if ( ! isset( $processed_map[ $item['index'] ] ) ) {
+				$untranslated[] = $item;
+			}
+		}
 
-		// ── Auto-translate non-translatable strings directly ──────────────────
+		// ── Авто-превод на непреводими низове ─────────────────────────────────
 		$auto_translate_map = [];
+		$auto_processed     = [];
 		foreach ( $untranslated as $item ) {
 			$is_non_trans = false;
 			if ( $item['plural'] !== null ) {
@@ -124,8 +163,8 @@ class Ajax {
 			}
 
 			if ( $is_non_trans ) {
+				$nplurals = Po_Handler::get_nplurals( $entries );
 				if ( $item['plural'] !== null ) {
-					$nplurals       = Po_Handler::get_nplurals( $entries );
 					$plural_vals    = [];
 					$plural_vals[0] = $item['msgid'];
 					for ( $k = 1; $k < $nplurals; $k++ ) {
@@ -135,44 +174,58 @@ class Ajax {
 				} else {
 					$auto_translate_map[ $item['index'] ] = $item['msgid'];
 				}
+				$auto_processed[] = $item['index'];
 
 				if ( ! empty( $item['duplicates'] ) ) {
 					foreach ( $item['duplicates'] as $dup_idx ) {
-						if ( $item['plural'] !== null ) {
-							$auto_translate_map[ $dup_idx ] = $plural_vals;
-						} else {
-							$auto_translate_map[ $dup_idx ] = $item['msgid'];
-						}
+						$auto_translate_map[ $dup_idx ] = $auto_translate_map[ $item['index'] ];
+						$auto_processed[]               = $dup_idx;
 					}
 				}
 			}
 		}
 
 		if ( ! empty( $auto_translate_map ) ) {
-			$entries = Po_Handler::apply_translations( $entries, $auto_translate_map );
-			Po_Handler::save( $po_path, $entries );
-			if ( $job_id ) {
-				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
+			$entries   = Po_Handler::apply_translations( $entries, $auto_translate_map );
+			$save_res  = Po_Handler::save( $po_path, $entries );
+			if ( is_wp_error( $save_res ) ) {
+				wp_send_json_error( [ 'message' => $save_res->get_error_message() ] );
 			}
-			$untranslated = Po_Handler::get_untranslated( $entries, $skip_translated );
+
+			$job_state['translated_indices'] = array_merge( $job_state['translated_indices'], $auto_processed );
+			$job_state['processed_indices']  = array_merge( $job_state['processed_indices'], $auto_processed );
+			$job_state['file_mtime']         = filemtime( $po_path );
+			set_transient( $transient_key, $job_state, 2 * HOUR_IN_SECONDS );
+
+			// Обновяване на списъка с оставащи
+			$all_untrans   = Po_Handler::get_untranslated( $entries, $skip_translated );
+			$processed_map = array_flip( $job_state['processed_indices'] );
+			$untranslated  = [];
+			foreach ( $all_untrans as $item ) {
+				if ( ! isset( $processed_map[ $item['index'] ] ) ) {
+					$untranslated[] = $item;
+				}
+			}
 		}
 
-		$remaining_now  = count( $untranslated );
-		$total_original = max( 1, absint( $_POST['total_original'] ?? $remaining_now ) );
+		$remaining_now = count( $untranslated );
+		$total_initial = max( 1, $job_state['total_initial'] );
 
-		if ( $remaining_now === 0 ) {
-			wp_send_json_success( [
+		if ( 0 === $remaining_now ) {
+			delete_transient( $transient_key );
+			$response = [
 				'done'       => true,
-				'message'    => 'All strings are already translated.',
-				'translated' => $total_original,
-				'skipped'    => 0,
-				'total'      => $total_original,
+				'message'    => 'Всички низове са преведени успешно.',
+				'translated' => count( array_unique( $job_state['translated_indices'] ) ),
+				'skipped'    => count( array_unique( $job_state['failed_indices'] ) ),
+				'total'      => $total_initial,
 				'percent'    => 100,
 				'remaining'  => 0,
-			] );
+			];
+			wp_send_json_success( $response );
 		}
 
-		// ── Dynamic Character-Based Batching ──────────────────────────────────
+		// ── Изчисляване на партида по символи и овърхед ───────────────────────
 		$batch              = [];
 		$current_char_count = 0;
 		$max_chars          = 3000;
@@ -182,7 +235,9 @@ class Ajax {
 				break;
 			}
 
-			$item_len = strlen( $item['msgid'] ) + ( $item['plural'] !== null ? strlen( $item['plural'] ) : 0 );
+			$item_len = strlen( $item['msgid'] ) +
+						( $item['plural'] !== null ? strlen( $item['plural'] ) : 0 ) +
+						( $item['msgctxt'] !== null ? strlen( $item['msgctxt'] ) : 0 ) + 80; // JSON structure overhead
 
 			if ( ! empty( $batch ) && ( $current_char_count + $item_len > $max_chars ) ) {
 				break;
@@ -192,117 +247,160 @@ class Ajax {
 			$current_char_count += $item_len;
 		}
 
-		$source_strings = [];
-		foreach ( $batch as $item ) {
-			if ( $item['plural'] !== null ) {
-				$source_strings[] = [ $item['msgid'], $item['plural'] ];
-			} else {
-				$source_strings[] = $item['msgid'];
-			}
-		}
 		$client         = new Api_Client();
+		$nplurals       = Po_Handler::get_nplurals( $entries );
 		$batch_start_ts = microtime( true );
 
-		// ── Retry loop ────────────────────────────────────────────────────────
-		$result      = null;
-		$last_error  = '';
-		$attempt     = 0;
-		$token_usage = [ 'prompt' => 0, 'completion' => 0, 'total' => 0 ];
+		// ── Цикъл за повторни опити (Retry Loop) ──────────────────────────────
+		$result             = null;
+		$last_error_msg     = '';
+		$attempt            = 0;
+		$token_usage        = [ 'prompt' => 0, 'completion' => 0, 'total' => 0 ];
+		$correction_prompt  = '';
+		$temp_override      = null;
 
 		while ( $attempt <= $max_retries ) {
 			if ( $attempt > 0 ) {
-				sleep( min( (int) pow( 2, $attempt - 1 ), 8 ) );
+				$sleep_sec = min( (int) pow( 2, $attempt - 1 ), 8 ) + rand( 0, 1000 ) / 1000;
+				usleep( (int) ( $sleep_sec * 1000000 ) );
 			}
 
-			$nplurals = Po_Handler::get_nplurals( $entries );
-			$try      = $client->translate_batch( $source_strings, $target_lang, $nplurals );
+			$try = $client->translate_batch( $batch, $target_lang, $nplurals, $correction_prompt, $temp_override );
 
 			if ( ! is_wp_error( $try ) ) {
 				$result = $try;
 				if ( isset( $result['_usage'] ) ) {
 					$token_usage = $result['_usage'];
 					unset( $result['_usage'] );
-					$result = array_values( $result );
 				}
 				break;
 			}
 
-			$last_error = $try->get_error_message();
+			$err_data      = $try->get_error_data();
+			$last_error_msg = $try->get_error_message();
+			$is_retryable  = $err_data['retryable'] ?? true;
+
+			// Неповтаряеми грешки (напр. 401 Unauthorized, 403 Forbidden, 404) спират веднага
+			if ( ! $is_retryable ) {
+				wp_send_json_error( [
+					'message'   => 'Фатална грешка от AI провайдъра: ' . $last_error_msg,
+					'retryable' => false,
+				] );
+			}
+
+			// Ако валидацията се е провалила, подаваме инструкция за корекция на следващия опит
+			if ( 'validation_failed' === $try->get_error_code() ) {
+				$correction_prompt = $last_error_msg;
+				$temp_override     = 0.0; // Нулева температура за по-строг спазване
+			}
+
+			// Уважаване на Retry-After хедъра при 429
+			if ( ! empty( $err_data['retry_after'] ) && $err_data['retry_after'] > 0 ) {
+				sleep( min( (int) $err_data['retry_after'], 15 ) );
+			}
+
 			$attempt++;
 		}
 
 		$batch_ms = (int) round( ( microtime( true ) - $batch_start_ts ) * 1000 );
 
-		// ── Apply or skip ─────────────────────────────────────────────────────
-		$skipped_count = 0;
-		if ( $result === null ) {
-			error_log( sprintf(
-				'[Err.or AI Translator] Batch failed after %d retries. Error: %s. Skipping %d strings.',
-				$max_retries, $last_error, count( $batch )
-			) );
+		// ── Прилагане на преводите или отбелязване на неуспех ─────────────────
+		$batch_processed_indices = [];
+		$batch_translated_count  = 0;
+		$batch_failed_count      = 0;
+		$save_warning            = '';
 
-			$skip_map = [];
+		if ( null === $result ) {
+			// Партидата е пропаднала трайно след всички retries.
+			// Отбелязваме в job_state БЕЗ да добавяме fuzzy флаг в PO файла!
 			foreach ( $batch as $item ) {
-				$skip_map[ $item['index'] ] = '';
+				$batch_processed_indices[] = $item['index'];
+				$job_state['failed_indices'][] = $item['index'];
+				$batch_failed_count++;
+
 				if ( ! empty( $item['duplicates'] ) ) {
 					foreach ( $item['duplicates'] as $dup_idx ) {
-						$skip_map[ $dup_idx ] = '';
+						$batch_processed_indices[] = $dup_idx;
+						$job_state['failed_indices'][] = $dup_idx;
+						$batch_failed_count++;
 					}
 				}
 			}
-
-			$skipped_count = count( $skip_map );
-			$entries       = Po_Handler::flag_as_skipped( $entries, array_keys( $skip_map ) );
-			Po_Handler::save( $po_path, $entries );
-			if ( $job_id ) {
-				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
-			}
 		} else {
 			$translation_map = [];
-			foreach ( array_values( $batch ) as $i => $item ) {
-				$translated = $result[ $i ] ?? '';
-				if ( $translated !== '' && $translated !== null ) {
-					$translation_map[ $item['index'] ] = $translated;
+			foreach ( $batch as $item ) {
+				$po_idx     = $item['index'];
+				$translated = $result[ $po_idx ] ?? null;
+
+				if ( null !== $translated ) {
+					$translation_map[ $po_idx ] = $translated;
+					$batch_processed_indices[]  = $po_idx;
+					$job_state['translated_indices'][] = $po_idx;
+					$batch_translated_count++;
 
 					if ( ! empty( $item['duplicates'] ) ) {
 						foreach ( $item['duplicates'] as $dup_idx ) {
 							$translation_map[ $dup_idx ] = $translated;
+							$batch_processed_indices[]  = $dup_idx;
+							$job_state['translated_indices'][] = $dup_idx;
+							$batch_translated_count++;
 						}
 					}
 				} else {
-					$skipped_count += 1 + count( $item['duplicates'] ?? [] );
+					$batch_processed_indices[]     = $po_idx;
+					$job_state['failed_indices'][] = $po_idx;
+					$batch_failed_count++;
 				}
 			}
 
-			$entries = Po_Handler::apply_translations( $entries, $translation_map );
-			$saved   = Po_Handler::save( $po_path, $entries );
+			if ( ! empty( $translation_map ) ) {
+				$entries  = Po_Handler::apply_translations( $entries, $translation_map );
+				$saved_res = Po_Handler::save( $po_path, $entries );
 
-			if ( is_wp_error( $saved ) ) {
-				wp_send_json_error( [ 'message' => $saved->get_error_message() ] );
-			}
-
-			if ( $job_id ) {
-				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
+				if ( is_wp_error( $saved_res ) ) {
+					// При предупреждение за MO компилация
+					if ( 'mo_compile_warning' === $saved_res->get_error_code() ) {
+						$save_warning = $saved_res->get_error_message();
+					} else {
+						wp_send_json_error( [ 'message' => $saved_res->get_error_message() ] );
+					}
+				}
 			}
 		}
 
-		$remaining_after = count( Po_Handler::get_untranslated( $entries, $skip_translated ) );
+		// Обновяване на Job State
+		$job_state['processed_indices'] = array_values( array_unique( array_merge( $job_state['processed_indices'], $batch_processed_indices ) ) );
+		$job_state['translated_indices'] = array_values( array_unique( $job_state['translated_indices'] ) );
+		$job_state['failed_indices']     = array_values( array_unique( $job_state['failed_indices'] ) );
+		$job_state['batch_sequence']++;
+		$job_state['file_mtime'] = file_exists( $po_path ) ? filemtime( $po_path ) : 0;
 
-		$translated_so_far = $total_original - $remaining_after;
-		$percent           = min( 100, (int) round( ( $translated_so_far / $total_original ) * 100 ) );
-		$is_done           = ( $remaining_after === 0 );
+		$all_untrans   = Po_Handler::get_untranslated( $entries, $skip_translated );
+		$processed_map = array_flip( $job_state['processed_indices'] );
+		$remaining_cnt = 0;
+		foreach ( $all_untrans as $item ) {
+			if ( ! isset( $processed_map[ $item['index'] ] ) ) {
+				$remaining_cnt++;
+			}
+		}
 
-		if ( $is_done && $job_id ) {
-			delete_transient( 'error_lait_entries_' . $job_id );
+		$translated_total = count( $job_state['translated_indices'] );
+		$skipped_total    = count( $job_state['failed_indices'] );
+		$percent          = min( 100, (int) round( ( ( $translated_total + $skipped_total ) / $total_initial ) * 100 ) );
+		$is_done          = ( 0 === $remaining_cnt );
+
+		$source_strings = [];
+		foreach ( $batch as $b_item ) {
+			$source_strings[] = $b_item['msgid'];
 		}
 
 		$response = [
 			'done'              => $is_done,
-			'batch_index'       => $batch_index + 1,
-			'translated'        => $translated_so_far,
-			'skipped'           => $skipped_count,
-			'total'             => $total_original,
-			'remaining'         => $remaining_after,
+			'batch_index'       => $job_state['batch_sequence'],
+			'translated'        => $translated_total,
+			'skipped'           => $skipped_total,
+			'total'             => $total_initial,
+			'remaining'         => $remaining_cnt,
 			'percent'           => $percent,
 			'batch_count'       => count( $batch ),
 			'batch_ms'          => $batch_ms,
@@ -310,12 +408,18 @@ class Ajax {
 			'tokens_prompt'     => $token_usage['prompt'],
 			'tokens_completion' => $token_usage['completion'],
 			'tokens_total'      => $token_usage['total'],
+			'save_warning'      => $save_warning,
 		];
 
-		if ( $skipped_count > 0 && $result === null ) {
-			$response['skip_reason'] = sprintf(
-				'Batch skipped after %d retries: %s', $max_retries, $last_error
-			);
+		if ( ! empty( $request_id ) ) {
+			$job_state['last_request_id'] = $request_id;
+			$job_state['last_response']   = $response;
+		}
+
+		if ( $is_done ) {
+			delete_transient( $transient_key );
+		} else {
+			set_transient( $transient_key, $job_state, 2 * HOUR_IN_SECONDS );
 		}
 
 		wp_send_json_success( $response );
@@ -324,27 +428,38 @@ class Ajax {
 	public function cancel_job() {
 		check_ajax_referer( 'error_lait_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+			wp_send_json_error( [ 'message' => 'Недостатъчни права.' ], 403 );
 		}
 
 		$job_id = sanitize_key( $_POST['job_id'] ?? '' );
 		if ( empty( $job_id ) ) {
-			wp_send_json_error( [ 'message' => 'No job_id provided.' ] );
+			wp_send_json_error( [ 'message' => 'Не е предоставен job_id.' ] );
 		}
 
 		set_transient( 'error_lait_cancel_' . $job_id, 1, 10 * MINUTE_IN_SECONDS );
-		delete_transient( 'error_lait_entries_' . $job_id );
+		delete_transient( 'error_lait_job_' . $job_id );
 
-		wp_send_json_success( [ 'message' => 'Cancel signal sent.' ] );
+		wp_send_json_success( [ 'message' => 'Сигналът за отмяна е изпратен.' ] );
 	}
 
 	public function fetch_models() {
 		check_ajax_referer( 'error_lait_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+			wp_send_json_error( [ 'message' => 'Недостатъчни права.' ], 403 );
 		}
 
-		$client = new Api_Client();
+		$overrides = [];
+		if ( ! empty( $_POST['provider'] ) ) {
+			$overrides['provider'] = sanitize_text_field( wp_unslash( $_POST['provider'] ) );
+		}
+		if ( ! empty( $_POST['api_endpoint'] ) ) {
+			$overrides['api_endpoint'] = esc_url_raw( trim( wp_unslash( $_POST['api_endpoint'] ) ) );
+		}
+		if ( isset( $_POST['api_key'] ) && '' !== trim( $_POST['api_key'] ) ) {
+			$overrides['api_key'] = sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
+		}
+
+		$client = new Api_Client( $overrides );
 		$models = $client->fetch_models();
 
 		if ( is_wp_error( $models ) ) {
@@ -357,32 +472,64 @@ class Ajax {
 	public function test_connection() {
 		check_ajax_referer( 'error_lait_nonce', 'nonce' );
 		if ( ! current_user_can( 'manage_options' ) ) {
-			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+			wp_send_json_error( [ 'message' => 'Недостатъчни права.' ], 403 );
 		}
 
-		$client = new Api_Client();
-		$result = $client->translate_batch( [ 'Hello' ], 'Bulgarian' );
+		$overrides = [];
+		if ( ! empty( $_POST['provider'] ) ) {
+			$overrides['provider'] = sanitize_text_field( wp_unslash( $_POST['provider'] ) );
+		}
+		if ( ! empty( $_POST['api_endpoint'] ) ) {
+			$overrides['api_endpoint'] = esc_url_raw( trim( wp_unslash( $_POST['api_endpoint'] ) ) );
+		}
+		if ( isset( $_POST['api_key'] ) && '' !== trim( $_POST['api_key'] ) ) {
+			$overrides['api_key'] = sanitize_text_field( wp_unslash( $_POST['api_key'] ) );
+		}
+		if ( ! empty( $_POST['model'] ) ) {
+			$overrides['model'] = sanitize_text_field( wp_unslash( $_POST['model'] ) );
+		}
+
+		$test_batch = [
+			[
+				'index'      => 0,
+				'msgid'      => 'Hello',
+				'plural'     => null,
+				'msgctxt'    => null,
+				'duplicates' => [],
+			],
+		];
+
+		$client = new Api_Client( $overrides );
+		$result = $client->translate_batch( $test_batch, 'Bulgarian' );
 
 		if ( is_wp_error( $result ) ) {
 			wp_send_json_error( [ 'message' => $result->get_error_message() ] );
 		}
 
+		$out = $result[0] ?? '(празно)';
+
 		wp_send_json_success( [
-			'message'     => 'Connection successful!',
+			'message'     => 'Връзката е успешна!',
 			'test_input'  => 'Hello',
-			'test_output' => $result[0] ?? '(empty)',
+			'test_output' => is_array( $out ) ? implode( ' / ', $out ) : $out,
 		] );
 	}
 
+	/**
+	 * Строга валидация на PO пътя спрямо канонични позволени директории.
+	 *
+	 * @param  string $raw
+	 * @return string|\WP_Error
+	 */
 	private function validate_po_path( $raw ) {
 		$path = trim( $raw );
 
 		if ( empty( $path ) ) {
-			return new \WP_Error( 'empty_path', 'No .po file path provided.' );
+			return new \WP_Error( 'empty_path', 'Не е предоставен път до .po файл.' );
 		}
 
 		if ( strtolower( pathinfo( $path, PATHINFO_EXTENSION ) ) !== 'po' ) {
-			return new \WP_Error( 'not_po', 'File must have a .po extension.' );
+			return new \WP_Error( 'not_po', 'Файлът трябва да има разширение .po.' );
 		}
 
 		$path = wp_normalize_path( $path );
@@ -391,73 +538,86 @@ class Ajax {
 			return $this->verify_po_path( $path );
 		}
 
+		// Опит за разрешаване спрямо позволените канонични корени
 		$rel   = ltrim( $path, '/' );
-		$bases = [
-			wp_normalize_path( WP_CONTENT_DIR ) . '/',
-			wp_normalize_path( WP_PLUGIN_DIR ) . '/',
-			wp_normalize_path( ABSPATH ),
-			wp_normalize_path( ABSPATH ),
-		];
+		$roots = $this->get_allowed_roots();
 
-		$filename = basename( $path );
-		if ( $rel === $filename ) {
-			$slug    = $this->extract_slug_from_filename( $filename );
-			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/loco/plugins/';
-			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/loco/themes/';
-			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/plugins/';
-			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/themes/';
-			if ( $slug ) {
-				$bases[] = wp_normalize_path( WP_PLUGIN_DIR ) . '/' . $slug . '/languages/';
-			}
-		}
-
-		foreach ( $bases as $base ) {
-			$candidate = wp_normalize_path( $base . $rel );
+		foreach ( $roots as $root ) {
+			$candidate = wp_normalize_path( $root . '/' . $rel );
 			$result    = $this->verify_po_path( $candidate );
 			if ( ! is_wp_error( $result ) ) {
 				return $result;
 			}
 		}
 
-		$tried = array_map( function ( $b ) use ( $rel ) {
-			return $b . $rel;
-		}, array_unique( $bases ) );
-
 		return new \WP_Error(
 			'not_found',
-			sprintf(
-				'File not found: %s — checked %d locations. Make sure the file exists and is readable.',
-				esc_html( basename( $path ) ),
-				count( $tried )
-			)
+			sprintf( 'Файлът не бе открит: %s. Проверете дали съществува и е достъпен.', esc_html( basename( $path ) ) )
 		);
 	}
 
+	/**
+	 * Проверява дали пътят е канонично намиращ се в позволените WordPress/Loco корени.
+	 *
+	 * @param  string $path
+	 * @return string|\WP_Error
+	 */
 	private function verify_po_path( $path ) {
-		if ( ! file_exists( $path ) ) {
-			return new \WP_Error( 'not_found', 'File not found: ' . esc_html( basename( $path ) ) );
+		$real_path = realpath( $path );
+		if ( ! $real_path || ! file_exists( $real_path ) ) {
+			return new \WP_Error( 'not_found', 'Файлът не съществува: ' . esc_html( basename( $path ) ) );
 		}
 
-		if ( ! is_readable( $path ) ) {
-			return new \WP_Error( 'not_readable', 'File not readable: ' . esc_html( basename( $path ) ) );
+		if ( strtolower( pathinfo( $real_path, PATHINFO_EXTENSION ) ) !== 'po' ) {
+			return new \WP_Error( 'not_po', 'Файлът не е с разширение .po.' );
 		}
 
-		$content_dir = wp_normalize_path( WP_CONTENT_DIR );
-		$plugin_dir  = wp_normalize_path( WP_PLUGIN_DIR );
-
-		$in_content = strpos( $path, $content_dir ) === 0;
-		$in_plugins = strpos( $path, $plugin_dir ) === 0;
-
-		if ( ! $in_content && ! $in_plugins ) {
-			return new \WP_Error( 'outside_wp', 'File must be inside wp-content or wp-plugins directory.' );
+		if ( ! is_readable( $real_path ) ) {
+			return new \WP_Error( 'not_readable', 'Файлът не е достъпен за четене.' );
 		}
 
-		return $path;
+		$real_path_norm = wp_normalize_path( $real_path );
+		$roots          = $this->get_allowed_roots();
+		$is_allowed     = false;
+
+		foreach ( $roots as $root ) {
+			$real_root = realpath( $root );
+			if ( ! $real_root ) {
+				continue;
+			}
+			$real_root_norm = wp_normalize_path( trailingslashit( $real_root ) );
+			if ( 0 === strpos( $real_path_norm, $real_root_norm ) || $real_path_norm === wp_normalize_path( $real_root ) ) {
+				$is_allowed = true;
+				break;
+			}
+		}
+
+		if ( ! $is_allowed ) {
+			return new \WP_Error( 'outside_allowed_roots', 'Файлът се намира извън разрешените WordPress директории за превод.' );
+		}
+
+		return $real_path_norm;
 	}
 
-	private function extract_slug_from_filename( $filename ) {
-		$base = pathinfo( $filename, PATHINFO_FILENAME );
-		$base = preg_replace( '/-[a-z]{2,3}(?:_[A-Z]{2,3})?$/', '', $base );
-		return sanitize_key( $base );
+	/**
+	 * Връща масив от канонични позволени коренни директории.
+	 *
+	 * @return array
+	 */
+	private function get_allowed_roots() {
+		$roots = [
+			wp_normalize_path( WP_CONTENT_DIR ),
+			wp_normalize_path( WP_PLUGIN_DIR ),
+			wp_normalize_path( WP_CONTENT_DIR . '/languages' ),
+			wp_normalize_path( WP_CONTENT_DIR . '/languages/loco/plugins' ),
+			wp_normalize_path( WP_CONTENT_DIR . '/languages/loco/themes' ),
+			wp_normalize_path( get_theme_root() ),
+		];
+
+		if ( defined( 'WP_LANG_DIR' ) ) {
+			$roots[] = wp_normalize_path( WP_LANG_DIR );
+		}
+
+		return array_unique( array_filter( $roots ) );
 	}
 }

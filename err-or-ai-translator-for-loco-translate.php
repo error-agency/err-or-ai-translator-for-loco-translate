@@ -3,7 +3,7 @@
  * Plugin Name:       Err.or AI Translator for Loco Translate
  * Plugin URI:        https://github.com/error-agency/err-or-ai-translator-for-loco-translate
  * Description:       Adds AI-assisted translation to Loco Translate using OpenRouter, Ollama, or a custom OpenAI-compatible endpoint.
- * Version:           1.6.0
+ * Version:           1.6.1
  * Requires at least: 6.0
  * Requires PHP:      7.4
  * Author:            Err.or agency
@@ -38,7 +38,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'ERROR_LAIT_VERSION', '1.6.0' );
+define( 'ERROR_LAIT_VERSION', '1.6.1' );
 define( 'ERROR_LAIT_PATH', plugin_dir_path( __FILE__ ) );
 define( 'ERROR_LAIT_URL', plugin_dir_url( __FILE__ ) );
 define( 'ERROR_LAIT_BASENAME', plugin_basename( __FILE__ ) );
@@ -61,6 +61,7 @@ final class Plugin {
 
 	private function includes() {
 		require_once ERROR_LAIT_PATH . 'includes/class-settings.php';
+		require_once ERROR_LAIT_PATH . 'includes/class-translation-validator.php';
 		require_once ERROR_LAIT_PATH . 'includes/class-api-client.php';
 		require_once ERROR_LAIT_PATH . 'includes/class-po-handler.php';
 		require_once ERROR_LAIT_PATH . 'includes/class-ajax.php';

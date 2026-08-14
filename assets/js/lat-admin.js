@@ -34,11 +34,18 @@
         const $select = $('#lat-model-select');
         const $input = $('#lat-model-input');
 
+        const provider    = $('.lat-provider-tab input[type=radio]:checked').val();
+        const apiEndpoint = $('#lat-api-endpoint').val().trim();
+        const apiKey      = $('input[name="error_lait_settings[api_key]"]').val().trim();
+
         $btn.text('Loading…').prop('disabled', true);
 
         $.post(errorLaitAdmin.ajaxUrl, {
             action: 'error_lait_fetch_models',
             nonce: errorLaitAdmin.nonce,
+            provider: provider,
+            api_endpoint: apiEndpoint,
+            api_key: apiKey,
         }, function (res) {
             $btn.text('↻ Load Models').prop('disabled', false);
 
@@ -74,12 +81,21 @@
         const $btn = $(this);
         const $result = $('#lat-test-result');
 
+        const provider    = $('.lat-provider-tab input[type=radio]:checked').val();
+        const apiEndpoint = $('#lat-api-endpoint').val().trim();
+        const apiKey      = $('input[name="error_lait_settings[api_key]"]').val().trim();
+        const model       = $('#lat-model-input').val().trim();
+
         $btn.text('Testing…').prop('disabled', true);
         $result.removeClass('lat-test-ok lat-test-err').text('');
 
         $.post(errorLaitAdmin.ajaxUrl, {
             action: 'error_lait_test_connection',
             nonce: errorLaitAdmin.nonce,
+            provider: provider,
+            api_endpoint: apiEndpoint,
+            api_key: apiKey,
+            model: model,
         }, function (res) {
             $btn.text('🔌 Test Connection').prop('disabled', false);
 

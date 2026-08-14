@@ -11,7 +11,7 @@ class Settings {
 	const OPTION_KEY         = 'error_lait_settings';
 	const LEGACY_OPTION_KEY  = 'lat_settings';
 	const SCHEMA_VERSION_KEY = 'error_lait_schema_version';
-	const SCHEMA_VERSION     = '1.6.0';
+	const SCHEMA_VERSION     = '1.6.1';
 
 	public static function instance() {
 		if ( null === self::$instance ) {
@@ -38,7 +38,6 @@ class Settings {
 		if ( version_compare( $current_version, self::SCHEMA_VERSION, '<' ) ) {
 			$new_settings = get_option( self::OPTION_KEY, null );
 
-			// Only migrate legacy settings if the new option key does not exist yet
 			if ( null === $new_settings ) {
 				$legacy = get_option( self::LEGACY_OPTION_KEY, null );
 				if ( is_array( $legacy ) && ! empty( $legacy ) ) {
@@ -52,11 +51,24 @@ class Settings {
 	}
 
 	public function sanitize_settings( $input ) {
-		$clean = [];
+		$existing = get_option( self::OPTION_KEY, [] );
+		$clean    = [];
 
-		$clean['provider']        = sanitize_text_field( $input['provider'] ?? 'openrouter' );
-		$clean['api_endpoint']    = esc_url_raw( trim( $input['api_endpoint'] ?? '' ) );
-		$clean['api_key']         = sanitize_text_field( $input['api_key'] ?? '' );
+		$provider          = sanitize_text_field( $input['provider'] ?? 'openrouter' );
+		$clean['provider'] = in_array( $provider, [ 'openrouter', 'ollama', 'custom' ], true ) ? $provider : 'openrouter';
+
+		$clean['api_endpoint'] = esc_url_raw( trim( $input['api_endpoint'] ?? '' ) );
+
+		// Запазване на съществуващия API ключ, ако е изпратено празно поле и не е поискано изчистване
+		$submitted_key = trim( $input['api_key'] ?? '' );
+		if ( ! empty( $input['clear_api_key'] ) ) {
+			$clean['api_key'] = '';
+		} elseif ( '' === $submitted_key && ! empty( $existing['api_key'] ) ) {
+			$clean['api_key'] = $existing['api_key'];
+		} else {
+			$clean['api_key'] = sanitize_text_field( $submitted_key );
+		}
+
 		$clean['model']           = sanitize_text_field( $input['model'] ?? '' );
 		$clean['batch_size']      = absint( $input['batch_size'] ?? 40 );
 		$clean['max_retries']     = absint( $input['max_retries'] ?? 3 );
@@ -64,7 +76,7 @@ class Settings {
 		$clean['skip_translated'] = ! empty( $input['skip_translated'] ) ? 1 : 0;
 		$clean['temperature']     = floatval( $input['temperature'] ?? 0.3 );
 
-		// Clamp values
+		// Ограничаване на стойностите
 		$clean['batch_size']  = max( 5, min( 100, $clean['batch_size'] ) );
 		$clean['max_retries'] = max( 0, min( 10,  $clean['max_retries'] ) );
 		$clean['temperature'] = max( 0, min( 2,   $clean['temperature'] ) );
@@ -98,11 +110,13 @@ class Settings {
 
 	public static function default_system_prompt( $target_lang, $nplurals = 2 ) {
 		return sprintf(
-			'Translate JSON array items to %s. ' .
-			'Rules: ' .
-			'- Preserve HTML tags, spacing, and placeholders (%%s, %%d, {var}) exactly. ' .
-			'- If an item is a plural array [singular, plural], translate it into exactly %d plural forms for %s as a nested JSON array. ' .
-			'- Return ONLY a JSON array in the exact same order. No extra text, explanations, or markdown fences.',
+			'You are a professional WordPress software translator translating strings into %s.' . "\n" .
+			'Rules:' . "\n" .
+			'1. Return ONLY a valid JSON object envelope with format: {"translations": [ {"id": "entry_X", "translation": "..."}, ... ]}' . "\n" .
+			'2. For plural items (having "singular" and "plural"), return: {"id": "entry_X", "translations": ["form1", "form2", ...]} with EXACTLY %d plural forms required for %s.' . "\n" .
+			'3. Preserve ALL placeholders (%%s, %%d, %%1$s, {var}, {{var}}) and HTML tags/attributes/entities exactly.' . "\n" .
+			'4. Respect the "context" property if present to provide accurate domain-specific translations.' . "\n" .
+			'5. Maintain exact item IDs ("entry_X"). Do not omit any requested ID or add extra IDs.',
 			$target_lang,
 			$nplurals,
 			$target_lang

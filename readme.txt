@@ -3,7 +3,7 @@ Contributors: errorwebagency
 Tags: translation, ai, localization, gettext, loco translate
 Requires at least: 6.0
 Tested up to: 7.0
-Stable tag: 1.6.0
+Stable tag: 1.6.1
 Requires PHP: 7.4
 License: GPL v2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -97,6 +97,19 @@ OpenRouter and custom endpoints generally require an API key. A locally running 
 AI-generated translations provide a baseline and should be reviewed for context and accuracy before being deployed into production.
 
 == Changelog ==
+
+= 1.6.1 =
+* Implemented full msgctxt context support and JSON-encoded deduplication keys.
+* Implemented deterministic ID-based AI request/response protocol (`entry_154`) and envelope validation.
+* Added Translation_Validator for strict tokenization of printf formats, variable templates, HTML tags/attributes, and entities.
+* Added plural form count validation against nplurals and Strategy B partial plural regeneration.
+* Structured translation job state in error_lait_job_{job_id} transients with idempotency request protection.
+* Stopped fuzzy flag misuse on API/network batch failures.
+* Implemented machine-readable WP_Error classification with early abort on permanent API errors (401, 403, 404).
+* Implemented atomic PO file saving with permission preservation and MO compilation error reporting.
+* Hardened canonical path validation against allowed WordPress language directories.
+* Masked API key values in HTML DOM and added clear API key functionality.
+* Added CLI automated test suite covering 30 pipeline assertions.
 
 = 1.6.0 =
 

@@ -4,6 +4,21 @@ All notable changes to this plugin are documented here.
 Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).  
 Versioning follows [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] — 2026-08-14
+
+### Translation Pipeline Overhaul & Security Hardening
+- **`msgctxt` Support & Safe Deduplication** — Full `msgctxt` support across the entire pipeline. Deduplication keys now use JSON-encoded `[msgctxt, msgid, msgid_plural]` arrays to prevent context collisons.
+- **Deterministic ID-Based AI Protocol** — Sent items include stable IDs based on original PO indices (`entry_154`). AI responses are parsed via JSON envelope (`{"translations": [...]}`) and mapped deterministically by ID.
+- **Strict Validation Layer** — Added `Translation_Validator` class for full tokenization of printf specifiers (`%s`, `%d`, `%02d`, `%1$s`, `%2$03d`, `%%`), variable templates (`{var}`, `{{var}}`), HTML tags/attributes (`href`, `src`, `title`, `alt`), and HTML entities (`&nbsp;`, `&amp;`, `&hellip;`).
+- **Plural Form Integrity & Strategy B** — Plural forms are validated against `nplurals`. Partial plural entries are treated as incomplete translation units and fully regenerated.
+- **Job Transient State & Idempotency** — Job state is maintained in `error_lait_job_{job_id}` transients. Includes `request_id` idempotency protection for AJAX retries.
+- **Non-Fuzzy Failure Tracking** — API/network failures no longer pollute PO entries with gettext fuzzy flags (`#, fuzzy`).
+- **Machine-Readable Error Classification** — `Api_Client` surfaces WP_Error data payloads (`http_status`, `retryable`, `retry_after`). Permanent errors (401, 403, 404) abort immediately. Validation failures trigger automatic prompt corrections.
+- **Atomic PO Saving & Permissions** — PO writes use temporary files (`.tmp.*`), `LOCK_EX`, permission preservation (`chmod`), and atomic `rename()`. MO compilation warnings are surfaced to UI.
+- **Canonical Roots Path Security** — Hardened `validate_po_path()` using `realpath()` boundary checks against allowed WordPress language and plugin/theme locations.
+- **API Key DOM Masking** — API key input fields no longer expose secrets in raw HTML DOM attributes and support explicit key clearing.
+- **Automated Test Suite** — Created CLI automated test runner (`tests/test-pipeline.php` and `tests/bootstrap.php`) covering 30 pipeline assertions.
+
 ---
 
 ## [1.6.0] — 2026-08-14
