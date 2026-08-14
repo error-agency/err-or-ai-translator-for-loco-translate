@@ -1,0 +1,13 @@
+.git
+.gitignore
+.distignore
+.editorconfig
+.vscode
+.idea
+*.ps1
+*.log
+*.bak
+*.zip
+scratch/
+tests/
+node_modules/

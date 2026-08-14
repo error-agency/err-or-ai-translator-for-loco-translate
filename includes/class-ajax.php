@@ -1,0 +1,463 @@
+<?php
+namespace ErrorAgency\LocoAITranslator;
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class Ajax {
+
+	private static $instance = null;
+
+	public static function instance() {
+		if ( null === self::$instance ) {
+			self::$instance = new self();
+		}
+		return self::$instance;
+	}
+
+	private function __construct() {
+		add_action( 'wp_ajax_error_lait_get_po_info', [ $this, 'get_po_info' ] );
+		add_action( 'wp_ajax_error_lait_translate_file', [ $this, 'translate_file' ] );
+		add_action( 'wp_ajax_error_lait_cancel_job', [ $this, 'cancel_job' ] );
+		add_action( 'wp_ajax_error_lait_fetch_models', [ $this, 'fetch_models' ] );
+		add_action( 'wp_ajax_error_lait_test_connection', [ $this, 'test_connection' ] );
+	}
+
+	public function get_po_info() {
+		check_ajax_referer( 'error_lait_nonce', 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+		}
+
+		$po_path = $this->validate_po_path( wp_unslash( $_POST['po_path'] ?? '' ) );
+		if ( is_wp_error( $po_path ) ) {
+			wp_send_json_error( [ 'message' => $po_path->get_error_message() ] );
+		}
+
+		$entries = Po_Handler::parse( $po_path );
+		if ( is_wp_error( $entries ) ) {
+			wp_send_json_error( [ 'message' => $entries->get_error_message() ] );
+		}
+
+		$settings        = Settings::instance();
+		$skip_translated = (bool) $settings->get( 'skip_translated', true );
+		$untranslated    = Po_Handler::get_untranslated( $entries, $skip_translated );
+		$total           = count( $entries );
+		$total_untrans   = count( $untranslated );
+
+		// Detect locale from filename
+		$basename        = pathinfo( $po_path, PATHINFO_FILENAME );
+		$detected_locale = '';
+		if ( preg_match( '/[-_]([a-z]{2,3}_[A-Z]{2,3})$/', $basename, $m ) ) {
+			$detected_locale = $m[1];
+		}
+
+		wp_send_json_success( [
+			'path'            => $po_path,
+			'total_entries'   => $total,
+			'untranslated'    => $total_untrans,
+			'detected_locale' => $detected_locale,
+		] );
+	}
+
+	public function translate_file() {
+		check_ajax_referer( 'error_lait_nonce', 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+		}
+
+		if ( ! ini_get( 'safe_mode' ) ) {
+			@set_time_limit( 300 );
+		}
+
+		$po_path     = $this->validate_po_path( wp_unslash( $_POST['po_path'] ?? '' ) );
+		$target_lang = sanitize_text_field( wp_unslash( $_POST['target_lang'] ?? 'Bulgarian' ) );
+		$batch_index = absint( $_POST['batch_index'] ?? 0 );
+		$job_id      = sanitize_key( $_POST['job_id'] ?? '' );
+
+		if ( is_wp_error( $po_path ) ) {
+			wp_send_json_error( [ 'message' => $po_path->get_error_message() ] );
+		}
+
+		// ── Cancel check ─────────────────────────────────────────────────────
+		if ( $job_id && get_transient( 'error_lait_cancel_' . $job_id ) ) {
+			delete_transient( 'error_lait_cancel_' . $job_id );
+			wp_send_json_success( [
+				'done'      => true,
+				'cancelled' => true,
+				'message'   => 'Translation cancelled by user.',
+			] );
+		}
+
+		$entries = null;
+		if ( $job_id ) {
+			$entries = get_transient( 'error_lait_entries_' . $job_id );
+		}
+
+		if ( empty( $entries ) || ! is_array( $entries ) ) {
+			$entries = Po_Handler::parse( $po_path );
+			if ( is_wp_error( $entries ) ) {
+				wp_send_json_error( [ 'message' => $entries->get_error_message() ] );
+			}
+		}
+
+		$settings        = Settings::instance();
+		$skip_translated = (bool) $settings->get( 'skip_translated', true );
+		$batch_sz        = max( 1, (int) $settings->get( 'batch_size', 40 ) );
+		$max_retries     = max( 0, (int) $settings->get( 'max_retries', 3 ) );
+
+		$untranslated = Po_Handler::get_untranslated( $entries, $skip_translated );
+
+		// ── Auto-translate non-translatable strings directly ──────────────────
+		$auto_translate_map = [];
+		foreach ( $untranslated as $item ) {
+			$is_non_trans = false;
+			if ( $item['plural'] !== null ) {
+				if ( Po_Handler::is_non_translatable( $item['msgid'] ) || Po_Handler::is_non_translatable( $item['plural'] ) ) {
+					$is_non_trans = true;
+				}
+			} else {
+				if ( Po_Handler::is_non_translatable( $item['msgid'] ) ) {
+					$is_non_trans = true;
+				}
+			}
+
+			if ( $is_non_trans ) {
+				if ( $item['plural'] !== null ) {
+					$nplurals       = Po_Handler::get_nplurals( $entries );
+					$plural_vals    = [];
+					$plural_vals[0] = $item['msgid'];
+					for ( $k = 1; $k < $nplurals; $k++ ) {
+						$plural_vals[ $k ] = $item['plural'];
+					}
+					$auto_translate_map[ $item['index'] ] = $plural_vals;
+				} else {
+					$auto_translate_map[ $item['index'] ] = $item['msgid'];
+				}
+
+				if ( ! empty( $item['duplicates'] ) ) {
+					foreach ( $item['duplicates'] as $dup_idx ) {
+						if ( $item['plural'] !== null ) {
+							$auto_translate_map[ $dup_idx ] = $plural_vals;
+						} else {
+							$auto_translate_map[ $dup_idx ] = $item['msgid'];
+						}
+					}
+				}
+			}
+		}
+
+		if ( ! empty( $auto_translate_map ) ) {
+			$entries = Po_Handler::apply_translations( $entries, $auto_translate_map );
+			Po_Handler::save( $po_path, $entries );
+			if ( $job_id ) {
+				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
+			}
+			$untranslated = Po_Handler::get_untranslated( $entries, $skip_translated );
+		}
+
+		$remaining_now  = count( $untranslated );
+		$total_original = max( 1, absint( $_POST['total_original'] ?? $remaining_now ) );
+
+		if ( $remaining_now === 0 ) {
+			wp_send_json_success( [
+				'done'       => true,
+				'message'    => 'All strings are already translated.',
+				'translated' => $total_original,
+				'skipped'    => 0,
+				'total'      => $total_original,
+				'percent'    => 100,
+				'remaining'  => 0,
+			] );
+		}
+
+		// ── Dynamic Character-Based Batching ──────────────────────────────────
+		$batch              = [];
+		$current_char_count = 0;
+		$max_chars          = 3000;
+
+		foreach ( $untranslated as $item ) {
+			if ( count( $batch ) >= $batch_sz ) {
+				break;
+			}
+
+			$item_len = strlen( $item['msgid'] ) + ( $item['plural'] !== null ? strlen( $item['plural'] ) : 0 );
+
+			if ( ! empty( $batch ) && ( $current_char_count + $item_len > $max_chars ) ) {
+				break;
+			}
+
+			$batch[]             = $item;
+			$current_char_count += $item_len;
+		}
+
+		$source_strings = [];
+		foreach ( $batch as $item ) {
+			if ( $item['plural'] !== null ) {
+				$source_strings[] = [ $item['msgid'], $item['plural'] ];
+			} else {
+				$source_strings[] = $item['msgid'];
+			}
+		}
+		$client         = new Api_Client();
+		$batch_start_ts = microtime( true );
+
+		// ── Retry loop ────────────────────────────────────────────────────────
+		$result      = null;
+		$last_error  = '';
+		$attempt     = 0;
+		$token_usage = [ 'prompt' => 0, 'completion' => 0, 'total' => 0 ];
+
+		while ( $attempt <= $max_retries ) {
+			if ( $attempt > 0 ) {
+				sleep( min( (int) pow( 2, $attempt - 1 ), 8 ) );
+			}
+
+			$nplurals = Po_Handler::get_nplurals( $entries );
+			$try      = $client->translate_batch( $source_strings, $target_lang, $nplurals );
+
+			if ( ! is_wp_error( $try ) ) {
+				$result = $try;
+				if ( isset( $result['_usage'] ) ) {
+					$token_usage = $result['_usage'];
+					unset( $result['_usage'] );
+					$result = array_values( $result );
+				}
+				break;
+			}
+
+			$last_error = $try->get_error_message();
+			$attempt++;
+		}
+
+		$batch_ms = (int) round( ( microtime( true ) - $batch_start_ts ) * 1000 );
+
+		// ── Apply or skip ─────────────────────────────────────────────────────
+		$skipped_count = 0;
+		if ( $result === null ) {
+			error_log( sprintf(
+				'[Err.or AI Translator] Batch failed after %d retries. Error: %s. Skipping %d strings.',
+				$max_retries, $last_error, count( $batch )
+			) );
+
+			$skip_map = [];
+			foreach ( $batch as $item ) {
+				$skip_map[ $item['index'] ] = '';
+				if ( ! empty( $item['duplicates'] ) ) {
+					foreach ( $item['duplicates'] as $dup_idx ) {
+						$skip_map[ $dup_idx ] = '';
+					}
+				}
+			}
+
+			$skipped_count = count( $skip_map );
+			$entries       = Po_Handler::flag_as_skipped( $entries, array_keys( $skip_map ) );
+			Po_Handler::save( $po_path, $entries );
+			if ( $job_id ) {
+				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
+			}
+		} else {
+			$translation_map = [];
+			foreach ( array_values( $batch ) as $i => $item ) {
+				$translated = $result[ $i ] ?? '';
+				if ( $translated !== '' && $translated !== null ) {
+					$translation_map[ $item['index'] ] = $translated;
+
+					if ( ! empty( $item['duplicates'] ) ) {
+						foreach ( $item['duplicates'] as $dup_idx ) {
+							$translation_map[ $dup_idx ] = $translated;
+						}
+					}
+				} else {
+					$skipped_count += 1 + count( $item['duplicates'] ?? [] );
+				}
+			}
+
+			$entries = Po_Handler::apply_translations( $entries, $translation_map );
+			$saved   = Po_Handler::save( $po_path, $entries );
+
+			if ( is_wp_error( $saved ) ) {
+				wp_send_json_error( [ 'message' => $saved->get_error_message() ] );
+			}
+
+			if ( $job_id ) {
+				set_transient( 'error_lait_entries_' . $job_id, $entries, 2 * HOUR_IN_SECONDS );
+			}
+		}
+
+		$remaining_after = count( Po_Handler::get_untranslated( $entries, $skip_translated ) );
+
+		$translated_so_far = $total_original - $remaining_after;
+		$percent           = min( 100, (int) round( ( $translated_so_far / $total_original ) * 100 ) );
+		$is_done           = ( $remaining_after === 0 );
+
+		if ( $is_done && $job_id ) {
+			delete_transient( 'error_lait_entries_' . $job_id );
+		}
+
+		$response = [
+			'done'              => $is_done,
+			'batch_index'       => $batch_index + 1,
+			'translated'        => $translated_so_far,
+			'skipped'           => $skipped_count,
+			'total'             => $total_original,
+			'remaining'         => $remaining_after,
+			'percent'           => $percent,
+			'batch_count'       => count( $batch ),
+			'batch_ms'          => $batch_ms,
+			'batch_preview'     => array_slice( $source_strings, 0, 3 ),
+			'tokens_prompt'     => $token_usage['prompt'],
+			'tokens_completion' => $token_usage['completion'],
+			'tokens_total'      => $token_usage['total'],
+		];
+
+		if ( $skipped_count > 0 && $result === null ) {
+			$response['skip_reason'] = sprintf(
+				'Batch skipped after %d retries: %s', $max_retries, $last_error
+			);
+		}
+
+		wp_send_json_success( $response );
+	}
+
+	public function cancel_job() {
+		check_ajax_referer( 'error_lait_nonce', 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+		}
+
+		$job_id = sanitize_key( $_POST['job_id'] ?? '' );
+		if ( empty( $job_id ) ) {
+			wp_send_json_error( [ 'message' => 'No job_id provided.' ] );
+		}
+
+		set_transient( 'error_lait_cancel_' . $job_id, 1, 10 * MINUTE_IN_SECONDS );
+		delete_transient( 'error_lait_entries_' . $job_id );
+
+		wp_send_json_success( [ 'message' => 'Cancel signal sent.' ] );
+	}
+
+	public function fetch_models() {
+		check_ajax_referer( 'error_lait_nonce', 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+		}
+
+		$client = new Api_Client();
+		$models = $client->fetch_models();
+
+		if ( is_wp_error( $models ) ) {
+			wp_send_json_error( [ 'message' => $models->get_error_message() ] );
+		}
+
+		wp_send_json_success( [ 'models' => $models ] );
+	}
+
+	public function test_connection() {
+		check_ajax_referer( 'error_lait_nonce', 'nonce' );
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_send_json_error( [ 'message' => 'Insufficient permissions.' ], 403 );
+		}
+
+		$client = new Api_Client();
+		$result = $client->translate_batch( [ 'Hello' ], 'Bulgarian' );
+
+		if ( is_wp_error( $result ) ) {
+			wp_send_json_error( [ 'message' => $result->get_error_message() ] );
+		}
+
+		wp_send_json_success( [
+			'message'     => 'Connection successful!',
+			'test_input'  => 'Hello',
+			'test_output' => $result[0] ?? '(empty)',
+		] );
+	}
+
+	private function validate_po_path( $raw ) {
+		$path = trim( $raw );
+
+		if ( empty( $path ) ) {
+			return new \WP_Error( 'empty_path', 'No .po file path provided.' );
+		}
+
+		if ( strtolower( pathinfo( $path, PATHINFO_EXTENSION ) ) !== 'po' ) {
+			return new \WP_Error( 'not_po', 'File must have a .po extension.' );
+		}
+
+		$path = wp_normalize_path( $path );
+
+		if ( path_is_absolute( $path ) ) {
+			return $this->verify_po_path( $path );
+		}
+
+		$rel   = ltrim( $path, '/' );
+		$bases = [
+			wp_normalize_path( WP_CONTENT_DIR ) . '/',
+			wp_normalize_path( WP_PLUGIN_DIR ) . '/',
+			wp_normalize_path( ABSPATH ),
+			wp_normalize_path( ABSPATH ),
+		];
+
+		$filename = basename( $path );
+		if ( $rel === $filename ) {
+			$slug    = $this->extract_slug_from_filename( $filename );
+			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/loco/plugins/';
+			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/loco/themes/';
+			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/plugins/';
+			$bases[] = wp_normalize_path( WP_CONTENT_DIR ) . '/languages/themes/';
+			if ( $slug ) {
+				$bases[] = wp_normalize_path( WP_PLUGIN_DIR ) . '/' . $slug . '/languages/';
+			}
+		}
+
+		foreach ( $bases as $base ) {
+			$candidate = wp_normalize_path( $base . $rel );
+			$result    = $this->verify_po_path( $candidate );
+			if ( ! is_wp_error( $result ) ) {
+				return $result;
+			}
+		}
+
+		$tried = array_map( function ( $b ) use ( $rel ) {
+			return $b . $rel;
+		}, array_unique( $bases ) );
+
+		return new \WP_Error(
+			'not_found',
+			sprintf(
+				'File not found: %s — checked %d locations. Make sure the file exists and is readable.',
+				esc_html( basename( $path ) ),
+				count( $tried )
+			)
+		);
+	}
+
+	private function verify_po_path( $path ) {
+		if ( ! file_exists( $path ) ) {
+			return new \WP_Error( 'not_found', 'File not found: ' . esc_html( basename( $path ) ) );
+		}
+
+		if ( ! is_readable( $path ) ) {
+			return new \WP_Error( 'not_readable', 'File not readable: ' . esc_html( basename( $path ) ) );
+		}
+
+		$content_dir = wp_normalize_path( WP_CONTENT_DIR );
+		$plugin_dir  = wp_normalize_path( WP_PLUGIN_DIR );
+
+		$in_content = strpos( $path, $content_dir ) === 0;
+		$in_plugins = strpos( $path, $plugin_dir ) === 0;
+
+		if ( ! $in_content && ! $in_plugins ) {
+			return new \WP_Error( 'outside_wp', 'File must be inside wp-content or wp-plugins directory.' );
+		}
+
+		return $path;
+	}
+
+	private function extract_slug_from_filename( $filename ) {
+		$base = pathinfo( $filename, PATHINFO_FILENAME );
+		$base = preg_replace( '/-[a-z]{2,3}(?:_[A-Z]{2,3})?$/', '', $base );
+		return sanitize_key( $base );
+	}
+}
